@@ -436,6 +436,60 @@ def distributed_data_generator(filename_pattern: str, batch_size: int, rank : in
         yield inputs, targets
 
 # -----------------------------------------------------------------------------
+# custom buckets for efficient allreduce
+def initialize_buckets(parameters, bucket_size_bytes):
+    buckets, current_bucket, current_size = [], [], 0
+    for param in parameters:
+        if param.requires_grad and param.grad is None:
+            param.grad = torch.zeros_like(param)
+        param_size = param.numel() * param.element_size()
+        if current_size + param_size > bucket_size_bytes and current_bucket:
+            buckets.append(current_bucket)
+            current_bucket = []
+            current_size = 0
+        current_bucket.append(param)
+        current_size += param_size
+    if current_bucket:
+        buckets.append(current_bucket)
+    flat_buffers, bucket_info = [], []
+    for bucket in buckets:
+        grad_shapes = [param.grad.shape for param in bucket]
+        total_elements = sum(param.grad.numel() for param in bucket)
+        device, dtype = bucket[0].device, bucket[0].dtype
+        flat_buffer = torch.zeros(total_elements, device=device, dtype=dtype)
+        flat_buffers.append(flat_buffer)
+        offsets, offset = [], 0
+        for param in bucket:
+            numel = param.grad.numel()
+            offsets.append((offset, offset + numel))
+            offset += numel
+        bucket_info.append({'params': bucket,'shapes': grad_shapes,'offsets': offsets})
+    return {'bucket_info': bucket_info, 'flat_buffers': flat_buffers}
+
+def reduce_gradients(bucket_data):
+    bucket_info, flat_buffers = bucket_data['bucket_info'], bucket_data['flat_buffers']
+    handles = []
+    for i, (info, flat_buffer) in enumerate(zip(bucket_info, flat_buffers)):
+        for param_idx, param in enumerate(info['params']):
+            if param.grad is not None:
+                start, end = info['offsets'][param_idx]
+                flat_buffer[start:end].copy_(param.grad.view(-1))
+        handle = dist.all_reduce(flat_buffer, op=dist.ReduceOp.AVG, async_op=True)
+        handles.append((handle, i))
+    return handles
+
+
+def unpack_gradients(bucket_data, handles):
+    bucket_info, flat_buffers = bucket_data['bucket_info'], bucket_data['flat_buffers']
+    for handle, bucket_idx in handles:
+        handle.wait()
+        info, flat_buffer = bucket_info[bucket_idx], flat_buffers[bucket_idx]
+        for param_idx, param in enumerate(info['params']):
+            if param.grad is not None:
+                start, end = info['offsets'][param_idx]
+                param.grad.copy_(flat_buffer[start:end].view(info['shapes'][param_idx]))
+
+# -----------------------------------------------------------------------------
 # int main
 
 @dataclass
@@ -521,6 +575,9 @@ optimizers = [optimizer1, optimizer2]
 for opt in optimizers:
     for group in opt.param_groups:
         group["initial_lr"] = group["lr"]
+
+#init the gradient buckets
+gradient_buckets = initialize_buckets(model.parameters(), 128.0 * 1024**2) # 128MB buckets
 
 # learning rate schedule: stable then decay
 def get_lr(step: int):
@@ -616,8 +673,7 @@ for step in range(train_steps + 1):
     # --------------- TRAINING SECTION -----------------
     inputs, targets = next(train_loader)
     model(inputs, targets, get_window_size_blocks(step)).backward()
-    for param in model.parameters():
-        dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
+    handles = reduce_gradients(gradient_buckets)
     # set optimization hyperparameters
     for opt in optimizers:
         for group in opt.param_groups:
@@ -625,6 +681,8 @@ for step in range(train_steps + 1):
     for group in optimizer2.param_groups:
         frac = min(step / 300, 1) # momentum warmup for muon
         group["momentum"] = (1 - frac) * 0.85 + frac * 0.95
+
+    unpack_gradients(gradient_buckets, handles)
     # step the optimizers
     for opt in optimizers:
         opt.step()
