@@ -577,7 +577,7 @@ for opt in optimizers:
         group["initial_lr"] = group["lr"]
 
 #init the gradient buckets
-gradient_buckets = initialize_buckets(model.parameters(), 128.0 * 1024**2) # 128MB buckets
+gradient_buckets = initialize_buckets(model.parameters(), 64.0 * 1024**2) # 128MB buckets
 
 # learning rate schedule: stable then decay
 def get_lr(step: int):
