@@ -28,7 +28,6 @@ RUN python -m pip install --upgrade pip && \
     pip install -r requirements.txt
 
 RUN pip3 uninstall -y torch torchvision torchaudio
-RUN pip install --pre torch==2.7.0.dev20250310+cu126 --index-url https://download.pytorch.org/whl/nightly/cu126 --upgrade
-
+RUN pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/cu126
 CMD ["bash"]
 ENTRYPOINT []
